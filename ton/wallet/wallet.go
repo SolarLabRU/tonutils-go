@@ -143,11 +143,14 @@ type Message struct {
 	InternalMessage *tlb.InternalMessage
 }
 
+type ExternalSigner func(message []byte) ([]byte, error)
+
 type Wallet struct {
-	api  TonAPI
-	key  ed25519.PrivateKey
-	addr *address.Address
-	ver  VersionConfig
+	api    TonAPI
+	key    ed25519.PrivateKey
+	pubKey ed25519.PublicKey
+	addr   *address.Address
+	ver    VersionConfig
 
 	// Can be used to operate multiple wallets with the same key and version.
 	// use GetSubwallet if you need it.
@@ -155,9 +158,22 @@ type Wallet struct {
 
 	// Stores a pointer to implementation of the version related functionality
 	spec any
+
+	// External provider for signing (optional)
+	signExternal ExternalSigner
 }
 
+type WalletOption func(*Wallet)
+
 func FromPrivateKey(api TonAPI, key ed25519.PrivateKey, version VersionConfig) (*Wallet, error) {
+	return NewWallet(
+		api,
+		key.Public().(ed25519.PublicKey),
+		version,
+		WithPrivateKey(key))
+}
+
+func NewWallet(api TonAPI, publicKey ed25519.PublicKey, version VersionConfig, options ...WalletOption) (*Wallet, error) {
 	var subwallet uint32 = DefaultSubwallet
 
 	// default subwallet depends on wallet type
@@ -167,17 +183,21 @@ func FromPrivateKey(api TonAPI, key ed25519.PrivateKey, version VersionConfig) (
 		subwallet = 0
 	}
 
-	addr, err := AddressFromPubKey(key.Public().(ed25519.PublicKey), version, subwallet)
+	addr, err := AddressFromPubKey(publicKey, version, subwallet)
 	if err != nil {
 		return nil, err
 	}
 
 	w := &Wallet{
 		api:       api,
-		key:       key,
 		addr:      addr,
 		ver:       version,
 		subwallet: subwallet,
+		pubKey:    publicKey,
+	}
+
+	for _, opt := range options {
+		opt(w)
 	}
 
 	w.spec, err = getSpec(w)
@@ -186,6 +206,18 @@ func FromPrivateKey(api TonAPI, key ed25519.PrivateKey, version VersionConfig) (
 	}
 
 	return w, nil
+}
+
+func WithPrivateKey(privateKey ed25519.PrivateKey) WalletOption {
+	return func(w *Wallet) {
+		w.key = privateKey
+	}
+}
+
+func WithSigner(signer ExternalSigner) WalletOption {
+	return func(w *Wallet) {
+		w.signExternal = signer
+	}
 }
 
 func getSpec(w *Wallet) (any, error) {
@@ -253,6 +285,18 @@ func getSpec(w *Wallet) (any, error) {
 	return nil, fmt.Errorf("cannot init spec: %w", ErrUnsupportedWalletVersion)
 }
 
+func (w *Wallet) sign(message []byte) ([]byte, error) {
+	if w.key == nil && w.signExternal == nil {
+		return nil, fmt.Errorf("cannot sign: private key and external sign is nil")
+	}
+
+	if w.key != nil {
+		return ed25519.Sign(w.key, message), nil
+	}
+
+	return w.signExternal(message)
+}
+
 // Address - returns old (bounce) version of wallet address
 // DEPRECATED: because of address reform, use WalletAddress,
 // it will return UQ format
@@ -270,17 +314,19 @@ func (w *Wallet) PrivateKey() ed25519.PrivateKey {
 }
 
 func (w *Wallet) GetSubwallet(subwallet uint32) (*Wallet, error) {
-	addr, err := AddressFromPubKey(w.key.Public().(ed25519.PublicKey), w.ver, subwallet)
+	addr, err := AddressFromPubKey(w.pubKey, w.ver, subwallet)
 	if err != nil {
 		return nil, err
 	}
 
 	sub := &Wallet{
-		api:       w.api,
-		key:       w.key,
-		addr:      addr,
-		ver:       w.ver,
-		subwallet: subwallet,
+		api:          w.api,
+		key:          w.key,
+		pubKey:       w.pubKey,
+		addr:         addr,
+		ver:          w.ver,
+		subwallet:    subwallet,
+		signExternal: w.signExternal,
 	}
 
 	sub.spec, err = getSpec(sub)
@@ -341,7 +387,7 @@ func (w *Wallet) BuildExternalMessageForMany(ctx context.Context, messages []*Me
 func (w *Wallet) PrepareExternalMessageForMany(ctx context.Context, withStateInit bool, messages []*Message) (_ *tlb.ExternalMessage, err error) {
 	var stateInit *tlb.StateInit
 	if withStateInit {
-		stateInit, err = GetStateInit(w.key.Public().(ed25519.PublicKey), w.ver, w.subwallet)
+		stateInit, err = GetStateInit(w.pubKey, w.ver, w.subwallet)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get state init: %w", err)
 		}
